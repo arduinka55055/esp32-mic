@@ -1,13 +1,24 @@
 import sounddevice as sd
 import numpy as np
 import socket
+import struct
 
-UDP_PORT = 12345
+
+MCAST_GRP = 'ff12::abcd'
+MCAST_PORT = 12345
 SAMPLE_RATE = 44100
-CHUNK = 240  # 480 bytes per packet
+CHUNK = 240
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(("0.0.0.0", UDP_PORT))
+sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(('', MCAST_PORT))
+
+# Join multicast group on all interfaces (interface index 0)
+group_bin = socket.inet_pton(socket.AF_INET6, MCAST_GRP)
+mreq = group_bin + struct.pack('@I', 18)  # 0 means all interfaces
+sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_JOIN_GROUP, mreq)
+
+print(f"Listening on IPv6 multicast {MCAST_GRP}:{MCAST_PORT}")
 
 print("Receiving UDP audio...")
 

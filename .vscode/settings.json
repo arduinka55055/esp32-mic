@@ -13,5 +13,10 @@
   "idf.portWin": "COM8",
   "python-envs.defaultEnvManager": "ms-python.python:system",
   "python-envs.pythonProjects": [],
-  "idf.monitorPort": "COM8"
+  "idf.monitorPort": "COM8",
+  "files.associations": {
+    "*.html": "html",
+    "event_groups.h": "c",
+    "esp_event.h": "c"
+  }
 }

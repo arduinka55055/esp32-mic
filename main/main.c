@@ -7,7 +7,7 @@
 #include "nvs_flash.h"
 #include "lwip/sockets.h"
 #include "lwip/netif.h"
-
+#include <stdint.h>
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
 
@@ -17,11 +17,11 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_IPV6_READY_BIT BIT1
 
-#define UDP_MULTICAST_GROUP "ff12::abcd"  // IPv6 multicast group
+#define UDP_MULTICAST_GROUP "ff0e::abcd"  // IPv6 multicast group
 #define UDP_TARGET_PORT 12345
 
 #define SAMPLE_RATE     44100
-#define CHUNK           240  // 240 samples * 2 bytes = 480 bytes (safe UDP)
+#define CHUNK           240 // 240 samples per packet (adjusted for ~5ms packets)
 #define I2S_PORT        0
 #define I2S_BCLK        GPIO_NUM_5
 #define I2S_WS          GPIO_NUM_6
@@ -30,6 +30,45 @@
 static EventGroupHandle_t wifi_event_group;
 static const char *TAG = "udp_audio";
 static int netif_index = 0;  // Network interface index
+
+
+// RTP defines
+#define RTP_HEADER_SIZE 12
+#define RTP_PAYLOAD_TYPE_L16_MONO 11
+#define RTP_CLOCK_RATE 44100  // PCMU standard sampling rate
+
+static uint16_t seq_num = 0;
+static uint32_t timestamp = 0;
+
+
+// μ-law encoding constants
+#define BIAS 0x84
+#define CLIP 32635
+
+static uint8_t linear_to_ulaw(int16_t pcm_val)
+{
+    int mask;
+    int seg;
+    uint8_t uval;
+
+    pcm_val = pcm_val >> 2; // reduce to 14-bit
+    if (pcm_val < 0) {
+        pcm_val = -pcm_val;
+        mask = 0x7F;
+    } else {
+        mask = 0xFF;
+    }
+
+    if (pcm_val > CLIP) pcm_val = CLIP;
+    pcm_val += BIAS;
+
+    seg = 0;
+    for (int i = pcm_val >> 7; i; i >>= 1) seg++;
+
+    uval = (seg << 4) | ((pcm_val >> (seg + 3)) & 0xF);
+    return ~uval & mask;
+}
+
 
 // Function to print IPv6 address type
 static const char* ipv6_addr_type_name(esp_ip6_addr_type_t type) {
@@ -110,13 +149,40 @@ static void wifi_init_sta()
     }
 }
 
+
+
+static void send_rtp_packet(int sock, struct sockaddr_in6 *dest_addr, uint8_t* payload, size_t payload_len) {
+    uint8_t packet[RTP_HEADER_SIZE + payload_len];
+
+    packet[0] = 0x80; // RTP v2
+    packet[1] = RTP_PAYLOAD_TYPE_L16_MONO & 0x7F;  // PT=11
+    packet[2] = seq_num >> 8;
+    packet[3] = seq_num & 0xFF;
+    packet[4] = (timestamp >> 24) & 0xFF;
+    packet[5] = (timestamp >> 16) & 0xFF;
+    packet[6] = (timestamp >> 8) & 0xFF;
+    packet[7] = timestamp & 0xFF;
+    // SSRC arbitrary but fixed
+    packet[8] = 0x12; packet[9] = 0x34; packet[10] = 0x56; packet[11] = 0x78;
+
+    memcpy(&packet[RTP_HEADER_SIZE], payload, payload_len);
+
+    int sent = sendto(sock, packet, RTP_HEADER_SIZE + payload_len, 0,
+                      (struct sockaddr *)dest_addr, sizeof(*dest_addr));
+    if (sent < 0) {
+        ESP_LOGE(TAG, "RTP UDP send failed: errno %d", errno);
+    }
+
+    seq_num++;
+    timestamp += CHUNK;  // number of samples per packet
+}
+
+
 static void udp_audio_stream_task(void *param)
 {
-    // Wait for IPv6 address assignment
     xEventGroupWaitBits(wifi_event_group, WIFI_IPV6_READY_BIT, false, true, portMAX_DELAY);
     ESP_LOGI(TAG, "Starting audio streaming...");
 
-    // Create IPv6 socket
     int sock = socket(AF_INET6, SOCK_DGRAM, IPPROTO_IPV6);
     if (sock < 0) {
         ESP_LOGE(TAG, "IPv6 socket create failed: errno %d", errno);
@@ -124,13 +190,11 @@ static void udp_audio_stream_task(void *param)
         return;
     }
 
-    // Set multicast hop limit (1 = local network only)
     unsigned char hop_limit = 1;
     if (setsockopt(sock, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &hop_limit, sizeof(hop_limit))) {
         ESP_LOGE(TAG, "Failed to set hop limit: errno %d", errno);
     }
 
-    // Configure destination address (multicast group)
     struct sockaddr_in6 dest_addr = {
         .sin6_family = AF_INET6,
         .sin6_port = htons(UDP_TARGET_PORT),
@@ -168,32 +232,25 @@ static void udp_audio_stream_task(void *param)
     i2s_channel_enable(rx_handle);
 
     int32_t i2s_buffer[CHUNK];
-    int16_t sample_buffer[CHUNK];  // 16-bit output buffer
+    int16_t sample_buffer[CHUNK];  // 16-bit linear PCM
     size_t bytes_read;
 
-    ESP_LOGI(TAG, "Streaming audio via UDP...");
-
     while (1) {
-        // Read from I2S
         esp_err_t res = i2s_channel_read(rx_handle, i2s_buffer, sizeof(i2s_buffer), &bytes_read, pdMS_TO_TICKS(500));
         if (res != ESP_OK) {
             ESP_LOGE(TAG, "I2S read failed: %d", res);
             continue;
         }
 
-        // Convert 32-bit samples to 16-bit
         for (int i = 0; i < CHUNK; i++) {
-            sample_buffer[i] = (int16_t)(i2s_buffer[i] >> 11);
+            int16_t sample = (int16_t)(i2s_buffer[i] >> 11);
+            sample_buffer[i] = (sample << 8) | ((sample >> 8) & 0xFF);
         }
 
-        // Send via multicast
-        int sent = sendto(sock, sample_buffer, sizeof(sample_buffer), 0,
-                         (struct sockaddr *)&dest_addr, sizeof(dest_addr));
-        if (sent < 0) {
-            ESP_LOGE(TAG, "UDP send failed: errno %d", errno);
-        }
+
+        send_rtp_packet(sock, &dest_addr, (uint8_t*)sample_buffer, sizeof(sample_buffer));
     }
-    
+
     close(sock);
     vTaskDelete(NULL);
 }

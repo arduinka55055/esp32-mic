@@ -26,6 +26,7 @@
 #define I2S_BCLK        GPIO_NUM_5
 #define I2S_WS          GPIO_NUM_6
 #define I2S_DIN         GPIO_NUM_4
+#define I2S_GND         GPIO_NUM_20
 
 static EventGroupHandle_t wifi_event_group;
 static const char *TAG = "udp_audio";
@@ -201,6 +202,21 @@ static void udp_audio_stream_task(void *param)
         .sin6_scope_id = netif_index
     };
     inet_pton(AF_INET6, UDP_MULTICAST_GROUP, &dest_addr.sin6_addr);
+
+
+    // set I2S_GND to 0
+    // Configure GPIO
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << I2S_GND),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+    // Set the GPIO to low (0V, GND)
+    gpio_set_level(I2S_GND, 0);
+
 
     // I2S configuration
     i2s_chan_handle_t rx_handle;

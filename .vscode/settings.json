@@ -9,7 +9,7 @@
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32c6"
   },
-  "idf.flashType": "UART",
+  "idf.flashType": "JTAG",
   "idf.portWin": "COM8",
   "python-envs.defaultEnvManager": "ms-python.python:system",
   "python-envs.pythonProjects": [],
